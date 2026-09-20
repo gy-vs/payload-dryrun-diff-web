@@ -1,20 +1,147 @@
 import express from 'express';
+import type {Response} from 'express';
 import {fileURLToPath} from 'node:url';
+import {createCatalogService} from './catalog';
+import {GenerationStaleError, RunManager} from './runManager';
+import type {RunEvent, StreamEvent} from '../shared/types';
 
-type RecordRow = {id:string;name:string;revision:number;content:string;updatedAt:string};
-const rows: RecordRow[] = [
-  {id:'alpha',name:'Primary transform runs',revision:3,content:'transform runs: alpha\nstate: active',updatedAt:new Date(0).toISOString()},
-  {id:'beta',name:'Secondary transform runs',revision:5,content:'transform runs: beta\nstate: review',updatedAt:new Date(1000).toISOString()},
-];
+export interface AppOptions {
+  runManager?: RunManager;
+  catalog?: ReturnType<typeof createCatalogService>;
+}
 
-export function createApp(){
-  const app=express();
-  app.use(express.json({limit:'1mb'}));
-  app.get('/api/bootstrap',(_req,res)=>res.json({family:"migration-mapping",count:rows.length}));
-  app.get('/api/mappings',(_req,res)=>res.json(rows.map(({content,...row})=>row)));
-  app.get('/api/mappings/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});res.set('ETag',String(row.revision)).json(row)});
-  app.put('/api/mappings/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});if(req.body.revision!==row.revision)return res.status(409).json({error:'revision_conflict',current:row});row.content=String(req.body.content??'');row.revision+=1;row.updatedAt=new Date().toISOString();res.json(row)});
-  app.post('/api/mappings/:id/analyze',async(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});await new Promise(resolve=>setTimeout(resolve,req.params.id==='alpha'?100:20));res.json({id:row.id,revision:row.revision,lines:String(req.body.content??row.content).split(/\r?\n/).length,diagnostics:[]})});
+export function createApp(options: AppOptions = {}) {
+  const app = express();
+  const catalog = options.catalog ?? createCatalogService();
+  const manager =
+    options.runManager ?? new RunManager({catalog, concurrency: 3, delayMs: 80, bufferSize: 128});
+
+  app.use(express.json({limit: '1mb'}));
+
+  // ---- Read-only review surface ---------------------------------------------
+
+  app.get('/api/catalog', (_req, res) => {
+    res.set('X-Sample-Generation', String(catalog.get().sampleGeneration));
+    res.json(catalog.get());
+  });
+
+  app.post('/api/runs', (req, res) => {
+    const {leftRevisionId, rightRevisionId, expectedGeneration, concurrency, sampleIds} =
+      req.body ?? {};
+    if (typeof leftRevisionId !== 'string' || typeof rightRevisionId !== 'string') {
+      return res.status(400).json({error: 'invalid_request', message: 'revision ids required'});
+    }
+    try {
+      const run = manager.createRun({
+        leftRevisionId,
+        rightRevisionId,
+        expectedGeneration,
+        concurrency,
+        sampleIds,
+      });
+      return res.status(201).json(run);
+    } catch (err) {
+      if (err instanceof GenerationStaleError) {
+        return res.status(409).json({
+          error: 'sample_set_updated',
+          expected: err.expected,
+          actual: err.actual,
+          catalog: catalog.get(),
+        });
+      }
+      return res.status(400).json({error: 'invalid_request', message: (err as Error).message});
+    }
+  });
+
+  app.get('/api/runs/:id', (req, res) => {
+    const run = manager.get(req.params.id);
+    if (!run) return res.status(404).json({error: 'run_not_found', message: 'session expired'});
+    res.json(run);
+  });
+
+  app.post('/api/runs/:id/cancel', (req, res) => {
+    const run = manager.cancel(req.params.id);
+    if (!run) return res.status(404).json({error: 'run_not_found', message: 'session expired'});
+    res.json(run);
+  });
+
+  // ---- Server-sent events with bounded replay buffer ------------------------
+
+  app.get('/api/runs/:id/events', (req, res) => {
+    const runId = req.params.id;
+    if (!manager.get(runId)) {
+      return res.status(404).json({error: 'run_not_found', message: 'session expired'});
+    }
+
+    res.status(200);
+    res.set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders?.();
+
+    const lastEventId = parseLastEventId(req.header('last-event-id')) ?? parseLastEventId(req.query.lastEventId);
+    const sink = {
+      onEvent(event: RunEvent | StreamEvent, id: number | undefined) {
+        writeEvent(res, event, id);
+      },
+    };
+    const unsubscribe = manager.subscribe(runId, sink, lastEventId ?? 0);
+    if (!unsubscribe) {
+      return res.status(404).json({error: 'run_not_found', message: 'session expired'});
+    }
+
+    const heartbeat = setInterval(() => {
+      res.write(': ping\n\n');
+    }, 15_000);
+    heartbeat.unref?.();
+
+    const close = () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    };
+    req.on('aborted', close);
+    req.on('close', close);
+    res.on('error', close);
+  });
+
+  // ---- Test/admin: rotate the FIXED sample set ------------------------------
+
+  app.post('/api/testing/sample-set', (req, res) => {
+    const generation = Number(req.body?.generation);
+    if (!Number.isInteger(generation) || generation < 1) {
+      return res.status(400).json({error: 'invalid_request', message: 'generation required'});
+    }
+    const next = catalog.rotateTo(generation);
+    res.set('X-Sample-Generation', String(next.sampleGeneration));
+    res.json({sampleGeneration: next.sampleGeneration, sampleIds: next.samples.map(s => s.id)});
+  });
+
   return app;
 }
-if(process.argv[1]===fileURLToPath(import.meta.url)){createApp().listen(4174,'127.0.0.1',()=>console.log('server http://127.0.0.1:4174'))}
+
+function parseLastEventId(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function writeEvent(res: Response, event: RunEvent | StreamEvent, id: number | undefined): void {
+  if (event.type === 'snapshot') {
+    // Synthetic event: carries the durable high-water mark instead of an id.
+    res.write(`event: snapshot\ndata: ${JSON.stringify(event)}\n\n`);
+    return;
+  }
+  // Durable id: the browser sends it back as Last-Event-ID on reconnect.
+  res.write(`id: ${id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const port = Number(process.env.PORT ?? 4174);
+  createApp().listen(port, '127.0.0.1', () => {
+    console.log(`dry-run review server http://127.0.0.1:${port}`);
+  });
+}
